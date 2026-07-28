@@ -1,5 +1,7 @@
 # AudioMuse-AI-DCLAP-Multilingual
 
+[![IIIA-3*](https://img.shields.io/badge/IIIA-3*-A865B3)](https://github.com/ErSanSan233/IIIA)
+
 A lightweight projection layer that adds multilingual text search to [AudioMuse-AI](https://github.com/NeptuneHub/AudioMuse-AI)'s existing DCLAP audio embeddings.
 
 > Only the text encoder path is changed; the audio embeddings and index remain untouched — no reindexing required.
