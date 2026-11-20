@@ -9,13 +9,10 @@ import json, argparse
 import onnxruntime as ort
 from tqdm import tqdm
 
-DCLAP_EMBEDS = Path("/mnt/ZFSData/Media/Dataload/models/dclap_gte_proj/dclap_text_embeds.npy")
-SD_CACHE = Path("/mnt/ZFSData/Media/Dataload/models/dclap_gte_proj/sd_full_cache.npz")
-GTE_INT8 = "/mnt/ZFSData/Media/Dataload/models/gte-multilingual-base/gte-multilingual-base-int8.onnx"
-GTE_TOKENIZER = "/mnt/ZFSData/Media/Dataload/models/gte-multilingual-base"
-CAPTIONS_DIR = Path("/mnt/ZFSData/Media/Dataload/dataset/multilingual_captions")
-OUTPUT_DIR = Path("/mnt/ZFSData/Media/Dataload/models/dclap_gte_proj")
 SEED = 42
+
+DCLAP_EMBEDS = SD_CACHE = CAPTIONS_DIR = OUTPUT_DIR = None
+GTE_INT8 = GTE_TOKENIZER = None
 
 torch.manual_seed(SEED)
 np.random.seed(SEED)
@@ -214,35 +211,36 @@ def train_one(arch, use_multipos, use_sd_audio, lr=2e-3, temperature=0.05,
     return best_mrr, best_state, model
 
 
+def run_config(arch, use_multipos, use_sd_audio):
+    label = f"{arch}|mp={'Y' if use_multipos else 'N'}|sd={'Y' if use_sd_audio else 'N'}"
+    print(f"\n{'='*60}")
+    print(f"  {label}")
+    print(f"{'='*60}")
+    mrr, state, model = train_one(arch, use_multipos, use_sd_audio)
+    print(f"  -> val MRR = {mrr:.4f}")
+
+    suffix = f"abl_{arch}_mp{int(use_multipos)}_sd{int(use_sd_audio)}"
+    torch.save(state, OUTPUT_DIR / f"best_proj_{suffix}.pt")
+    model.load_state_dict(state)
+    model.eval().cpu()
+    dummy = torch.randn(1, 768)
+    onnx_path = OUTPUT_DIR / f"gte_to_dclap_proj_{suffix}.onnx"
+    torch.onnx.export(model, dummy, str(onnx_path), opset_version=17,
+                      input_names=["input"],
+                      output_names=["output"],
+                      dynamic_axes={"input": {0: "batch"},
+                                   "output": {0: "batch"}})
+
+    return {"label": label, "mrr": mrr, "arch": arch,
+            "multipos": use_multipos, "sd_audio": use_sd_audio}
+
+
 def run_sweep():
-    archs = ["linear", "mlp256", "residual64"]
-    multipos_opts = [False, True]
-    sd_opts = [False, True]
-
     results = []
-    for arch in archs:
-        for mp in multipos_opts:
-            for sd in sd_opts:
-                label = f"{arch}|mp={'Y' if mp else 'N'}|sd={'Y' if sd else 'N'}"
-                print(f"\n{'='*60}")
-                print(f"  {label}")
-                print(f"{'='*60}")
-                mrr, state, model = train_one(arch, mp, sd)
-                print(f"  -> val MRR = {mrr:.4f}")
-                results.append({"label": label, "mrr": mrr, "arch": arch,
-                                "multipos": mp, "sd_audio": sd})
-
-                suffix = f"abl_{arch}_mp{int(mp)}_sd{int(sd)}"
-                torch.save(state, OUTPUT_DIR / f"best_proj_{suffix}.pt")
-                model.load_state_dict(state)
-                model.eval().cpu()
-                dummy = torch.randn(1, 768)
-                onnx_path = OUTPUT_DIR / f"gte_to_dclap_proj_{suffix}.onnx"
-                torch.onnx.export(model, dummy, str(onnx_path), opset_version=17,
-                                  input_names=["input"],
-                                  output_names=["output"],
-                                  dynamic_axes={"input": {0: "batch"},
-                                               "output": {0: "batch"}})
+    for arch in ("linear", "mlp256", "residual64"):
+        for mp in (False, True):
+            for sd in (False, True):
+                results.append(run_config(arch, mp, sd))
 
     print(f"\n{'='*60}")
     print(f"  ABLATION RESULTS (12 configs)")
@@ -254,5 +252,52 @@ def run_sweep():
         json.dump(results, f, indent=2)
 
 
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--config", default=None,
+                   help="single config as <arch>_mp{0,1}_sd{0,1} "
+                        "(e.g. mlp256_mp1_sd1); omit to run the full 12-config sweep")
+    p.add_argument("--dclap-embeds", required=True,
+                   help="path to dclap_text_embeds.npy (DCLAP teacher embeddings)")
+    p.add_argument("--sd-cache", required=True,
+                   help="path to sd_full_cache.npz (Song Describer audio cache)")
+    p.add_argument("--gte-onnx", required=True,
+                   help="path to the GTE multilingual INT8 ONNX model")
+    p.add_argument("--gte-tokenizer", required=True,
+                   help="path to the GTE tokenizer directory")
+    p.add_argument("--captions-dir", required=True,
+                   help="directory containing the multilingual caption JSON files")
+    p.add_argument("--output-dir", required=True,
+                   help="directory for checkpoints, ONNX exports and caches")
+    return p.parse_args(argv)
+
+
+def main(argv=None):
+    global DCLAP_EMBEDS, SD_CACHE, GTE_INT8, GTE_TOKENIZER, CAPTIONS_DIR, OUTPUT_DIR
+
+    args = parse_args(argv)
+    DCLAP_EMBEDS = Path(args.dclap_embeds)
+    SD_CACHE = Path(args.sd_cache)
+    GTE_INT8 = args.gte_onnx
+    GTE_TOKENIZER = args.gte_tokenizer
+    CAPTIONS_DIR = Path(args.captions_dir)
+    OUTPUT_DIR = Path(args.output_dir)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    if args.config:
+        parts = args.config.split("_")
+        if len(parts) != 3 or parts[0] not in ("linear", "mlp256", "residual64"):
+            raise SystemExit(
+                f"invalid --config {args.config!r}; expected "
+                "<arch>_mp{0,1}_sd{0,1} with arch in linear|mlp256|residual64"
+            )
+        arch, mp, sd = parts[0], parts[1] == "mp1", parts[2] == "sd1"
+        result = run_config(arch, mp, sd)
+        with open(OUTPUT_DIR / "ablation_results.json", "w") as f:
+            json.dump([result], f, indent=2)
+    else:
+        run_sweep()
+
+
 if __name__ == "__main__":
-    run_sweep()
+    main()
